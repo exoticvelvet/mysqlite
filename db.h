@@ -11,7 +11,11 @@ struct InputBuffer_t {
 };
 typedef struct InputBuffer_t InputBuffer;
 
-enum ExecuteResult_t {EXECTE_SUCCESS, EXECUTE_TABLE_FULL};
+enum ExecuteResult_t {
+  EXECTE_SUCCESS,
+  EXECUTE_DUPLICATE_KEY,
+  EXECUTE_TABLE_FULL
+};
 typedef enum ExecuteResult_t ExecuteResult;
 
 enum MetaCommandResult_t {
