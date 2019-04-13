@@ -60,10 +60,24 @@ struct Statement_t {
 };
 typedef struct Statement_t Statement;
 
-struct Table_t {
+struct Pager_t {
+  int file_descriptor;
+  uint32_t file_length;
   void* pages[TABLE_MAX_PAGES];
+};
+typedef struct Pager_t Pager;
+
+struct Table_t {
+  Pager* pager;
   uint32_t num_rows;
 };
 typedef struct Table_t Table;
+
+struct Cursor_t {
+  Table* table;
+  uint32_t row_num;
+  bool end_of_table; // Indicates a position one past the last element
+};
+typedef struct Cursor_t Cursor;
 
 #endif

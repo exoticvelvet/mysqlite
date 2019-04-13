@@ -1,7 +1,10 @@
+#include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 #include "db.h"
 
 void print_prompt() {
@@ -25,14 +28,6 @@ void read_input(InputBuffer* input_buffer) {
 void close_input_buffer(InputBuffer* input_buffer) {
   free(input_buffer->buffer);
   free(input_buffer);
-}
-
-MetaCommandResult do_meta_command(InputBuffer* input_buffer) {
-  if(strcmp(input_buffer->buffer, ".exit") == 0) {
-    exit(EXIT_SUCCESS);
-  } else {
-    return META_COMMAND_UNRECOGNIZED_COMMAND;
-  }
 }
 
 PrepareResult prepare_insert(InputBuffer* input_buffer, Statement* statement) {
@@ -79,7 +74,7 @@ PrepareResult prepare_statement(InputBuffer* input_buffer, Statement* statement)
 }
 
 void print_row(Row* row) {
-  printf("%d, %s, %s\n", row->id, row->username, row->email);
+  printf("(%d, %s, %s)\n", row->id, row->username, row->email);
 }
 
 void serialize_row(Row* source, void* destination) {
@@ -94,16 +89,166 @@ void deserialize_row(void* source, Row* destination) {
   memcpy(&(destination->email), source + EMAIL_OFFSET, EMAIL_SIZE);
 }
 
-void* row_slot(Table* table, uint32_t row_num) {
-  uint32_t page_num = row_num / ROWS_PER_PAGE;
-  void* page = table->pages[page_num];
-  if(!page) {
-    // Allocate memory only when we try to access page
-    page = table->pages[page_num] = malloc(PAGE_SIZE);
+Pager* pager_open(const char* filename) {
+  int fd = open(filename,
+                O_RDWR |   // read/write mode
+                  O_CREAT, // create file if it doesn't exist
+                S_IWUSR |  // User write permission
+                  S_IRUSR  // User read permission
+                );
+  if(fd == -1) {
+    printf("Unable to open file\n");
+    exit(EXIT_FAILURE);
   }
+
+  off_t file_length = lseek(fd, 0, SEEK_END);
+
+  Pager* pager = malloc(sizeof(Pager));
+  pager->file_descriptor = fd;
+  pager->file_length = file_length;
+
+  for(uint32_t i = 0; i < TABLE_MAX_PAGES; i++) {
+    pager->pages[i] = NULL;
+  }
+
+  return pager;
+}
+
+void* get_page(Pager* pager, uint32_t page_num) {
+  if(page_num > TABLE_MAX_PAGES) {
+    printf("Tried to fetch page number out of bounds. %d > %d\n", page_num, TABLE_MAX_PAGES);
+    exit(EXIT_FAILURE);
+  }
+
+  if(pager->pages[page_num] == NULL) {
+    // Cache miss. Allocate memory and load from file
+    void* page = malloc(PAGE_SIZE);
+    uint32_t num_pages = pager->file_length / PAGE_SIZE;
+
+    // We might save a partial page at the end of the file
+    if(pager->file_length % PAGE_SIZE) {
+      num_pages += 1;
+    }
+
+    if(page_num <= num_pages) {
+      lseek(pager->file_descriptor, page_num * PAGE_SIZE, SEEK_SET);
+      ssize_t bytes_read = read(pager->file_descriptor, page, PAGE_SIZE);
+      if(bytes_read == -1) {
+        printf("Error reading file: %d\n", errno);
+        exit(EXIT_FAILURE);
+      }
+
+      pager->pages[page_num] = page;
+    }
+  }
+
+  return pager->pages[page_num];
+}
+
+Table* db_open(const char* filename) {
+  Pager* pager = pager_open(filename);
+  uint32_t num_rows = pager->file_length / ROW_SIZE;
+
+  Table* table = calloc(1, sizeof(Table));
+  table->pager = pager;
+  table->num_rows = num_rows;
+
+  return table;
+}
+
+Cursor* table_start(Table* table) {
+  Cursor* cursor = malloc(sizeof(Cursor));
+  cursor->table = table;
+  cursor->row_num = 0;
+  cursor->end_of_table = (table->num_rows == 0);
+
+  return cursor;
+}
+
+Cursor* table_end(Table* table) {
+  Cursor* cursor = malloc(sizeof(Cursor));
+  cursor->table = table;
+  cursor->row_num = table->num_rows;
+  cursor->end_of_table = true;
+
+  return cursor;
+}
+
+void* cursor_value(Cursor* cursor) {
+  uint32_t row_num = cursor->row_num;
+  uint32_t page_num = row_num / ROWS_PER_PAGE;
+  void* page = get_page(cursor->table->pager, page_num);
   uint32_t row_offset = row_num % ROWS_PER_PAGE;
   uint32_t byte_offset = row_offset * ROW_SIZE;
   return page + byte_offset;
+}
+
+void cursor_advance(Cursor* cursor) {
+  cursor->row_num += 1;
+  if(cursor->row_num >= cursor->table->num_rows) {
+    cursor->end_of_table = true;
+  }
+}
+
+void pager_flush(Pager* pager, uint32_t page_num, uint32_t size) {
+  if(pager->pages[page_num] == NULL) {
+    printf("Tried to flush null page\n");
+    exit(EXIT_FAILURE);
+  }
+
+  off_t offset = lseek(pager->file_descriptor, page_num * PAGE_SIZE, SEEK_SET);
+
+  if(offset == -1) {
+    printf("Error seeking: %d\n", errno);
+    exit(EXIT_FAILURE);
+  }
+
+  ssize_t bytes_written = write(pager->file_descriptor, pager->pages[page_num], size);
+
+  if(bytes_written == -1) {
+    printf("Error writing: %d\n", errno);
+    exit(EXIT_FAILURE);
+  }
+}
+
+void db_close(Table* table) {
+  Pager* pager = table->pager;
+  uint32_t num_full_pages = table->num_rows / ROWS_PER_PAGE;
+
+  for(uint32_t i = 0; i < num_full_pages; i++) {
+    if(pager->pages[i] == NULL) {
+      continue;
+    }
+    pager_flush(pager, i, PAGE_SIZE);
+    free(pager->pages[i]);
+    pager->pages[i] = NULL;
+  }
+
+  // There may be a partial page to write to the end of the file
+  // This should not be need after we swtich to a B-tree
+  uint32_t num_additional_rows = table->num_rows % ROWS_PER_PAGE;
+  if(num_additional_rows > 0) {
+    uint32_t page_num = num_full_pages;
+    if(pager->pages[page_num] != NULL) {
+      pager_flush(pager, page_num, num_additional_rows * ROW_SIZE);
+      free(pager->pages[page_num]);
+      pager->pages[page_num] = NULL;
+    }
+  }
+
+  int result = close(pager->file_descriptor);
+  if(result == -1) {
+    printf("Error closing db file.\n");
+    exit(EXIT_FAILURE);
+  }
+  for(uint32_t i = 0; i < TABLE_MAX_PAGES; i++) {
+    void* page = pager->pages[i];
+    if(page) {
+      free(page);
+      pager->pages[i] = NULL;
+    }
+  }
+  free(pager);
 }
 
 InputBuffer* new_input_buffer() {
@@ -121,19 +266,27 @@ ExecuteResult execute_insert(Statement* statement, Table* table) {
   }
 
   Row* row_to_insert = &(statement->row_to_insert);
+  Cursor* cursor = table_end(table);
 
-  serialize_row(row_to_insert, row_slot(table, table->num_rows));
+  serialize_row(row_to_insert, cursor_value(cursor));
   table->num_rows += 1;
+
+  free(cursor);
 
   return EXECTE_SUCCESS;
 }
 
 ExecuteResult execute_select(Statement* statement, Table* table) {
+  Cursor* cursor = table_start(table);
+
   Row row;
-  for(uint32_t i = 0; i < table->num_rows; i++) {
-    deserialize_row(row_slot(table, i), &row);
+  while(!(cursor->end_of_table)) {
+    deserialize_row(cursor_value(cursor), &row);
     print_row(&row);
+    cursor_advance(cursor);
   }
+
+  free(cursor);
   return EXECTE_SUCCESS;
 }
 
@@ -146,22 +299,31 @@ ExecuteResult execute_statement(Statement* statement, Table* table) {
   }
 }
 
-Table* new_table() {
-  Table* table = calloc(1, sizeof(Table));
-  table->num_rows = 0;
-
-  return table;
+MetaCommandResult do_meta_command(InputBuffer* input_buffer, Table* table) {
+  if(strcmp(input_buffer->buffer, ".exit") == 0) {
+    db_close(table);
+    exit(EXIT_SUCCESS);
+  } else {
+    return META_COMMAND_UNRECOGNIZED_COMMAND;
+  }
 }
 
 int main(int argc, char* argv[]) {
-  Table* table = new_table();
+  if(argc < 2) {
+    printf("Must supply a database filename.\n");
+    exit(EXIT_FAILURE);
+  }
+
+  char* filename = argv[1];
+  Table* table = db_open(filename);
+
   InputBuffer* input_buffer = new_input_buffer();
   while (true) {
     print_prompt();
     read_input(input_buffer);
 
     if(input_buffer->buffer[0] == '.'){
-      switch (do_meta_command(input_buffer)) {
+      switch (do_meta_command(input_buffer, table)) {
         case (META_COMMAND_SUCCESS):
           continue;
         case (META_COMMAND_UNRECOGNIZED_COMMAND):
