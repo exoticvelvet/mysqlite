@@ -155,7 +155,7 @@ void* get_page(Pager* pager, uint32_t page_num) {
 
 
 uint32_t* leaf_node_num_cells(void* node) {
-  return (uint32_t*)node + LEAF_NODE_NUM_CELLS_OFFSET;
+  return (char *)node + LEAF_NODE_NUM_CELLS_OFFSET;
 }
 
 void* leaf_node_cell(void* node, uint32_t cell_num) {
@@ -281,9 +281,20 @@ void db_close(Table* table) {
   free(pager);
 }
 
+void print_leaf_node(void* node) {
+  uint32_t num_cells = *leaf_node_num_cells(node);
+  printf("leaf (size: %d)\n", num_cells);
+  for(uint32_t i = 0; i < num_cells; i++) {
+    uint32_t key = *leaf_node_key(node, i);
+    printf(" - %d : %d\n", i, key);
+  }
+}
+
 void leaf_node_insert(Cursor* cursor, uint32_t key, Row* value) {
   void* node = get_page(cursor->table->pager, cursor->page_num);
 
+  printf("Before insert into the node.\n");
+  print_leaf_node(node);
   uint32_t num_cells = *leaf_node_num_cells(node);
   if(num_cells >= LEAF_NODE_MAX_CELLS) {
     // Node full
@@ -301,6 +312,9 @@ void leaf_node_insert(Cursor* cursor, uint32_t key, Row* value) {
   *(leaf_node_num_cells(node)) += 1;
   *(leaf_node_key(node, cursor->cell_num)) = key;
   serialize_row(value, leaf_node_value(node, cursor->cell_num));
+
+  printf("After insert into the node.\n");
+  print_leaf_node(node);
 }
 
 InputBuffer* new_input_buffer() {
@@ -319,15 +333,6 @@ void print_constants() {
   printf("LEAF_NODE_CELL_SIZE: %d\n", LEAF_NODE_CELL_SIZE);
   printf("LEAF_NODE_SPACE_FOR_CELLS: %d\n", LEAF_NODE_SPACE_FOR_CELLS);
   printf("LEAF_NODE_MAX_CELLS: %d\n", LEAF_NODE_MAX_CELLS);
-}
-
-void print_leaf_node(void* node) {
-  uint32_t num_cells = *leaf_node_num_cells(node);
-  printf("leaf (size: %d)\n", num_cells);
-  for(uint32_t i = 0; i < num_cells; i++) {
-    uint32_t key = *leaf_node_key(node, i);
-    printf(" - %d : %d\n", i, key);
-  }
 }
 
 ExecuteResult execute_insert(Statement* statement, Table* table) {
